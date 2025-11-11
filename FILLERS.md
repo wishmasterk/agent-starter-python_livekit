@@ -75,7 +75,3 @@ Enhanced conversational AI built on LiveKit Agents SDK, featuring real-time fill
 | Accent / filler variants | Missed if not in `IGNORED_WORDS` list                | 🔧 Low                  |
 | Simultaneous overlap     | Long dual speech may cause STT drift                 | ⚙️ Medium               |
 
----
-
-## 🧪 5. How to run
-uv run src/agent.py console
