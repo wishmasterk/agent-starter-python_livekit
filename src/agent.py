@@ -1,5 +1,12 @@
-import logging
+# =====================================================
+# check1.py — Voice Agent with Filler & Interrupt Logging
+# =====================================================
 
+import logging
+import os
+import re
+import time
+import datetime
 from dotenv import load_dotenv
 from livekit.agents import (
     Agent,
@@ -12,87 +19,129 @@ from livekit.agents import (
     cli,
     inference,
     metrics,
+    UserInputTranscribedEvent,
 )
 from livekit.plugins import noise_cancellation, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
-logger = logging.getLogger("agent")
 
+# =========================================================================
+# 1️⃣ LOGGING CONFIGURATION
+# =========================================================================
+logger = logging.getLogger("agent")
+logger.setLevel(logging.INFO)
+
+console_handler = logging.StreamHandler()
+file_handler = logging.FileHandler("agent_filler_logs.log", mode="a")
+
+formatter = logging.Formatter(
+    fmt="%(asctime)s | %(levelname)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+)
+console_handler.setFormatter(formatter)
+file_handler.setFormatter(formatter)
+
+if not any(isinstance(h, logging.StreamHandler) for h in logger.handlers):
+    logger.addHandler(console_handler)
+if not any(isinstance(h, logging.FileHandler) for h in logger.handlers):
+    logger.addHandler(file_handler)
+
+
+# =========================================================================
+# 2️⃣ CONFIGURATION & UTILITIES
+# =========================================================================
 load_dotenv(".env.local")
 
+DEFAULT_FILLERS = (
+    "uh, um, umm, hmm, haan, mhm, hmmmmm, eh, er, ah, uh-huh, "
+    "you know, sort of, kind of, i guess, yeah sure, like, right, basically, literally, "
+    "haina, matlab, accha, acha, arre, arey, waise, to kya, ha, ji, theek hai, "
+    "hmm yeah, okay, ok, okk, okey, okeyy, ya, yaa, yup"
+)
+FILLER_WORDS_STR = os.environ.get("IGNORED_WORDS", DEFAULT_FILLERS).lower()
 
+DEFAULT_STOPS = (
+    "stop, wait, hold on, pause, one sec, one second, cancel, "
+    "hang on, listen, repeat, start over, quiet, mute, enough, bas, ruk, ruko, band karo"
+)
+STOP_WORDS_STR = os.environ.get("INTERRUPT_WORDS", DEFAULT_STOPS).lower()
+
+ASR_MIN_CONFIDENCE = float(os.environ.get("ASR_MIN_CONFIDENCE", "0.60"))
+INTERRUPT_DURATION_S = float(os.environ.get("INTERRUPT_DURATION_S", "5.0"))
+MIN_WORDS_FOR_INTERRUPT = int(os.environ.get("MIN_WORDS_FOR_INTERRUPT", "3"))
+
+FILLER_SET = set(w.strip() for w in FILLER_WORDS_STR.split(",") if w.strip())
+STOP_PHRASES = [p.strip() for p in STOP_WORDS_STR.split(",") if p.strip()]
+STOP_TOKENS = {p for p in STOP_PHRASES if " " not in p}
+
+
+# --- Utilities ---
+def clean_text(text: str) -> str:
+    return re.sub(r"[^\w\s]", "", text.lower()).strip()
+
+
+def tokenize(text: str):
+    return clean_text(text).split()
+
+
+def is_pure_filler(text: str) -> bool:
+    """True if all tokens are fillers (or text empty)."""
+    if not text or not text.strip():
+        return True
+    words = tokenize(text)
+    return bool(words) and all(word in FILLER_SET for word in words)
+
+
+def contains_interrupt_word(text: str) -> bool:
+    """True if text contains any configured stop/interrupt signal (whole words)."""
+    if not text or not text.strip():
+        return False
+    low = text.lower()
+
+    # Phrase-level (handles "hold on", "one second")
+    for phrase in STOP_PHRASES:
+        pattern = r"\b" + re.escape(phrase) + r"\b"
+        if re.search(pattern, low):
+            return True
+
+    toks = set(tokenize(low))
+    return any(tok in STOP_TOKENS for tok in toks)
+
+
+# =========================================================================
+# 3️⃣ ASSISTANT CLASS
+# =========================================================================
 class Assistant(Agent):
     def __init__(self) -> None:
         super().__init__(
-            instructions="""You are a helpful voice AI assistant. The user is interacting with you via voice, even if you perceive the conversation as text.
-            You eagerly assist users with their questions by providing information from your extensive knowledge.
-            Your responses are concise, to the point, and without any complex formatting or punctuation including emojis, asterisks, or other symbols.
-            You are curious, friendly, and have a sense of humor.""",
+            instructions=(
+                "You are a helpful, friendly, and conversational voice AI assistant. "
+                "The user interacts with you via voice, so keep responses natural, concise, and free from complex symbols."
+            ),
         )
-
-    # To add tools, use the @function_tool decorator.
-    # Here's an example that adds a simple weather tool.
-    # You also have to add `from livekit.agents import function_tool, RunContext` to the top of this file
-    # @function_tool
-    # async def lookup_weather(self, context: RunContext, location: str):
-    #     """Use this tool to look up current weather information in the given location.
-    #
-    #     If the location is not supported by the weather service, the tool will indicate this. You must tell the user the location's weather is unavailable.
-    #
-    #     Args:
-    #         location: The location to look up weather information for (e.g. city name)
-    #     """
-    #
-    #     logger.info(f"Looking up weather for {location}")
-    #
-    #     return "sunny with a temperature of 70 degrees."
 
 
 def prewarm(proc: JobProcess):
     proc.userdata["vad"] = silero.VAD.load()
 
 
+# =========================================================================
+# 4️⃣ ENTRYPOINT & EVENT HANDLERS
+# =========================================================================
 async def entrypoint(ctx: JobContext):
-    # Logging setup
-    # Add any other context you want in all log entries here
-    ctx.log_context_fields = {
-        "room": ctx.room.name,
-    }
+    ctx.log_context_fields = {"room": ctx.room.name}
+    logger.info(f"🚀 Starting agent in room: {ctx.room.name}")
 
-    # Set up a voice AI pipeline using OpenAI, Cartesia, AssemblyAI, and the LiveKit turn detector
     session = AgentSession(
-        # Speech-to-text (STT) is your agent's ears, turning the user's speech into text that the LLM can understand
-        # See all available models at https://docs.livekit.io/agents/models/stt/
         stt=inference.STT(model="assemblyai/universal-streaming", language="en"),
-        # A Large Language Model (LLM) is your agent's brain, processing user input and generating a response
-        # See all available models at https://docs.livekit.io/agents/models/llm/
         llm=inference.LLM(model="openai/gpt-4.1-mini"),
-        # Text-to-speech (TTS) is your agent's voice, turning the LLM's text into speech that the user can hear
-        # See all available models as well as voice selections at https://docs.livekit.io/agents/models/tts/
-        tts=inference.TTS(
-            model="cartesia/sonic-3", voice="9626c31c-bec5-4cca-baa8-f8ba9e84c8bc"
-        ),
-        # VAD and turn detection are used to determine when the user is speaking and when the agent should respond
-        # See more at https://docs.livekit.io/agents/build/turns
+        tts=inference.TTS(model="cartesia/sonic-3", voice="9626c31c-bec5-4cca-baa8-f8ba9e84c8bc"),
         turn_detection=MultilingualModel(),
         vad=ctx.proc.userdata["vad"],
-        # allow the LLM to generate a response while waiting for the end of turn
-        # See more at https://docs.livekit.io/agents/build/audio/#preemptive-generation
         preemptive_generation=True,
+        min_interruption_words=1,
+        false_interruption_timeout=0.4,
     )
 
-    # To use a realtime model instead of a voice pipeline, use the following session setup instead.
-    # (Note: This is for the OpenAI Realtime API. For other providers, see https://docs.livekit.io/agents/models/realtime/))
-    # 1. Install livekit-agents[openai]
-    # 2. Set OPENAI_API_KEY in .env.local
-    # 3. Add `from livekit.plugins import openai` to the top of this file
-    # 4. Use the following session setup instead of the version above
-    # session = AgentSession(
-    #     llm=openai.realtime.RealtimeModel(voice="marin")
-    # )
-
-    # Metrics collection, to measure pipeline performance
-    # For more information, see https://docs.livekit.io/agents/build/metrics/
     usage_collector = metrics.UsageCollector()
 
     @session.on("metrics_collected")
@@ -102,31 +151,104 @@ async def entrypoint(ctx: JobContext):
 
     async def log_usage():
         summary = usage_collector.get_summary()
-        logger.info(f"Usage: {summary}")
+        logger.info(f"📊 Usage Summary: {summary}")
 
     ctx.add_shutdown_callback(log_usage)
 
-    # # Add a virtual avatar to the session, if desired
-    # # For other providers, see https://docs.livekit.io/agents/models/avatar/
-    # avatar = hedra.AvatarSession(
-    #   avatar_id="...",  # See https://docs.livekit.io/agents/models/avatar/plugins/hedra
-    # )
-    # # Start the avatar and wait for it to join
-    # await avatar.start(session, room=ctx.room)
+    # =====================================================
+    # 🔹 MONITOR ASSISTANT SPEECH (TTS STATE)
+    # =====================================================
+    assistant_speaking = False
+    speak_start_time = None
 
-    # Start the session, which initializes the voice pipeline and warms up the models
+    @session.on("tts_started")
+    def _on_tts_start(_):
+        nonlocal assistant_speaking, speak_start_time
+        assistant_speaking = True
+        speak_start_time = datetime.datetime.now()
+        logger.info("🗣️ Assistant started speaking — ASR monitoring active.")
+
+    @session.on("tts_stopped")
+    def _on_tts_end(_):
+        nonlocal assistant_speaking
+        assistant_speaking = False
+        logger.info("🔇 Assistant finished speaking — ASR monitoring paused.")
+
+    # =====================================================
+    # 🔹 USER SPEECH PROCESSING
+    # =====================================================
+    @session.on("user_input_transcribed")
+    def _on_user_input_transcribed(ev: UserInputTranscribedEvent):
+        if not ev.is_final:
+            return
+
+        text = (ev.transcript or "").strip()
+        if not text:
+            return
+
+        ts = datetime.datetime.now().strftime("%H:%M:%S")
+        conf = getattr(ev, "confidence", None)
+        clean = clean_text(text)
+        word_count = len(clean.split())
+        duration = (
+            (datetime.datetime.now() - speak_start_time).total_seconds()
+            if speak_start_time
+            else 0
+        )
+
+        # While assistant speaking
+        if assistant_speaking:
+            # Filler words
+            if is_pure_filler(clean):
+                logger.info(f"[{ts}] 💤 ASR filler ignored during TTS: '{text}' (elapsed={duration:.2f}s)")
+                return
+
+            # Stopwords (immediate interrupt)
+            if contains_interrupt_word(clean):
+                logger.info(f"[{ts}] ⛔ ASR stopword interrupt during TTS: '{text}' (elapsed={duration:.2f}s)")
+                session.interrupt()
+                return
+
+            # Real user speech (time/length based)
+            if word_count >= MIN_WORDS_FOR_INTERRUPT or duration > INTERRUPT_DURATION_S:
+                logger.info(
+                    f"[{ts}] ⚡ REAL interrupt (while speaking): '{text}' "
+                    f"(words={word_count}, elapsed={duration:.2f}s, conf={conf})"
+                )
+                session.interrupt()
+                return
+
+            # Short bursts (optional interrupt)
+            logger.info(f"[{ts}] ⚡ SHORT burst ignored during TTS: '{text}' (words={word_count})")
+            return
+
+        # When agent is quiet
+        if is_pure_filler(clean):
+            logger.info(f"[{ts}] 💤 FILLER (agent quiet): '{text}'")
+            return
+
+        if contains_interrupt_word(clean):
+            logger.info(f"[{ts}] ⛔ STOPWORD (agent quiet): '{text}'")
+            session.interrupt()
+            return
+
+        logger.info(f"[{ts}] 📝 REGISTER normal input: '{text}'")
+
+    # =====================================================
+    # 🔹 START SESSION
+    # =====================================================
+
     await session.start(
         agent=Assistant(),
         room=ctx.room,
-        room_input_options=RoomInputOptions(
-            # For telephony applications, use `BVCTelephony` for best results
-            noise_cancellation=noise_cancellation.BVC(),
-        ),
+        room_input_options=RoomInputOptions(noise_cancellation=noise_cancellation.BVC()),
     )
-
-    # Join the room and connect to the user
     await ctx.connect()
+    logger.info("✅ Agent session initialized successfully and listening...")
 
 
+# =========================================================================
+# 5️⃣ MAIN ENTRYPOINT
+# =========================================================================
 if __name__ == "__main__":
     cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, prewarm_fnc=prewarm))
