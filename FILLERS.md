@@ -1,4 +1,4 @@
-# 🎙️ Voice Agent — Context-Aware Filler & Interrupt Guard
+# 🗣️ Voice Agent — Context-Aware Filler & Interrupt Guard
 
 Enhanced conversational AI built on LiveKit Agents SDK, featuring real-time filler suppression, controlled interruptions, and detailed logging through a modular ConversationGuard class.
 
@@ -11,7 +11,7 @@ Enhanced conversational AI built on LiveKit Agents SDK, featuring real-time fill
 | **Filler Handling**       | ❌ None          | ✅ Ignores fillers (“uh”, “hmm”, “ok”) during agent speech           |
 | **Stopword Detection**    | ❌ None          | ✅ Interrupts instantly on words like “stop”, “ruko”, “wait”         |
 | **Context Awareness**     | ❌ None          | ✅ Distinguishes when agent is speaking vs. silent                   |
-| **Time-based Interrupts** | ❌ None          | ✅ Ends TTS if user talks for > 5 s or ≥ 3 words                     |
+| **Time-based Interrupts** | ❌ None          | ✅ Ends TTS if user talks for 4 s or ≥ 3 words                       |
 | **Environment Config**    | Hardcoded       | ✅ Controlled through `.env` variables via `InterruptConfig`         |
 | **Logging**               | Minimal         | ✅ Timestamped structured logs with reason + transcript              |
 | **Architecture**          | Flat procedural | ✅ Modular, OOP: `ConversationGuard`, `InterruptConfig`, `Assistant` |
