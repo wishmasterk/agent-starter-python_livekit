@@ -1,0 +1,17 @@
+2025-11-11 23:29:17 | INFO | agent | Prewarm: Silero VAD loaded and cached in proc.userdata
+2025-11-11 23:29:17 | INFO | agent | Starting new voice session for room=mock_room
+2025-11-11 23:29:18 | INFO | agent | ConversationGuard initialized | fillers=30 | stop_phrases=14
+2025-11-11 23:29:19 | INFO | agent | Agent session fully started and connected for room=mock_room
+2025-11-11 23:29:24 | INFO | agent | ConversationGuard: normal user input | text='Hey hello'
+2025-11-11 23:29:26 | INFO | agent | ConversationGuard: normal user input | text="How's the josh."
+2025-11-11 23:29:37 | INFO | agent | ConversationGuard: normal user input | text='Okay so this is keisha.'
+2025-11-11 23:29:38 | INFO | agent | ConversationGuard: normal user input | text='What about you.'
+2025-11-11 23:30:00 | INFO | agent | ConversationGuard: normal user input | text='Okay so I think I need to test you so that so in order in the morning I have an assignment on I have to write an essay on the ethics of ai'
+2025-11-11 23:30:08 | INFO | agent | ConversationGuard: normal user input | text='So for that prepare a one minute speech for that and tell me how to narrate that in front of the whole class.'
+2025-11-11 23:30:36 | INFO | agent | ConversationGuard: filler while silent ignored | text='Yeah.'
+2025-11-11 23:30:49 | INFO | agent | ConversationGuard: filler while silent ignored | text='Okay.'
+2025-11-11 23:31:09 | INFO | agent | ConversationGuard: normal user input | text='So thank you with this but now just before ending tell me a joke.'
+2025-11-11 23:31:22 | INFO | agent | ConversationGuard: filler while silent ignored | text='Yeah.'
+2025-11-11 23:31:24 | INFO | agent | ConversationGuard: normal user input | text='Thank you you were funny.'
+2025-11-11 23:31:33 | INFO | agent | ConversationGuard: normal user input | text='Bye.'
+2025-11-11 23:31:55 | INFO | agent | Usage summary: UsageSummary(llm_prompt_tokens=2988, llm_prompt_cached_tokens=0, llm_input_audio_tokens=0, llm_completion_tokens=490, llm_output_audio_tokens=0, tts_characters_count=1979, tts_audio_duration=130.9600000000002, stt_audio_duration=133.75000000000068)

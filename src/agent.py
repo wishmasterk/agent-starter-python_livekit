@@ -1,12 +1,14 @@
-# =====================================================
-# check1.py — Voice Agent with Filler & Interrupt Logging
-# =====================================================
+# ================================================
+# updated agent.py with filler word and interruption control
+# ================================================
 
 import logging
 import os
 import re
 import time
-import datetime
+from dataclasses import dataclass
+from typing import List
+
 from dotenv import load_dotenv
 from livekit.agents import (
     Agent,
@@ -16,239 +18,358 @@ from livekit.agents import (
     MetricsCollectedEvent,
     RoomInputOptions,
     WorkerOptions,
+    UserInputTranscribedEvent,
     cli,
     inference,
     metrics,
-    UserInputTranscribedEvent,
 )
 from livekit.plugins import noise_cancellation, silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
+# ============================================================
+# 1. CONFIG & TEXT HELPERS
+# ============================================================
 
-# =========================================================================
-# 1️⃣ LOGGING CONFIGURATION
-# =========================================================================
-logger = logging.getLogger("agent")
-logger.setLevel(logging.INFO)
-
-console_handler = logging.StreamHandler()
-file_handler = logging.FileHandler("agent_filler_logs.log", mode="a")
-
-formatter = logging.Formatter(
-    fmt="%(asctime)s | %(levelname)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
-)
-console_handler.setFormatter(formatter)
-file_handler.setFormatter(formatter)
-
-if not any(isinstance(h, logging.StreamHandler) for h in logger.handlers):
-    logger.addHandler(console_handler)
-if not any(isinstance(h, logging.FileHandler) for h in logger.handlers):
-    logger.addHandler(file_handler)
-
-
-# =========================================================================
-# 2️⃣ CONFIGURATION & UTILITIES
-# =========================================================================
 load_dotenv(".env.local")
 
-DEFAULT_FILLERS = (
-    "uh, um, umm, hmm, haan, mhm, hmmmmm, eh, er, ah, uh-huh, "
-    "you know, sort of, kind of, i guess, yeah sure, like, right, basically, literally, "
-    "haina, matlab, accha, acha, arre, arey, waise, to kya, ha, ji, theek hai, "
-    "hmm yeah, okay, ok, okk, okey, okeyy, ya, yaa, yup"
-)
-FILLER_WORDS_STR = os.environ.get("IGNORED_WORDS", DEFAULT_FILLERS).lower()
+@dataclass
+class InterruptConfig:
+    """
+    Holds all configuration used by the interruption / filler logic.
+    Values can be overridden via environment variables.
+    """
 
-DEFAULT_STOPS = (
-    "stop, wait, hold on, pause, one sec, one second, cancel, "
-    "hang on, listen, repeat, start over, quiet, mute, enough, bas, ruk, ruko, band karo"
-)
-STOP_WORDS_STR = os.environ.get("INTERRUPT_WORDS", DEFAULT_STOPS).lower()
+    ignored_words: List[str]
+    stop_phrases: List[str]
+    min_words_for_interrupt: int
+    max_tts_speaking_before_any_interrupt: float
 
-ASR_MIN_CONFIDENCE = float(os.environ.get("ASR_MIN_CONFIDENCE", "0.60"))
-INTERRUPT_DURATION_S = float(os.environ.get("INTERRUPT_DURATION_S", "5.0"))
-MIN_WORDS_FOR_INTERRUPT = int(os.environ.get("MIN_WORDS_FOR_INTERRUPT", "3"))
+    @classmethod
+    def from_env(cls) -> "InterruptConfig":
+        # Filler / hesitation words (Hindi + English flavored)
+        default_fillers = (
+            "uh, umm, ummm, hmm, hmm, haan, hn, haann, mhm, eh, er, ah, uhh, ok, okay, Okay, okayy, yeah, ya, yaa, acha, accha, arre,"
+            "right, basically, literally, like, you know, so, well, actually, just"
+        )
+        fillers_raw = os.getenv("IGNORED_WORDS", default_fillers)
+        ignored_words = [w.strip().lower() for w in fillers_raw.split(",") if w.strip()]
 
-FILLER_SET = set(w.strip() for w in FILLER_WORDS_STR.split(",") if w.strip())
-STOP_PHRASES = [p.strip() for p in STOP_WORDS_STR.split(",") if p.strip()]
-STOP_TOKENS = {p for p in STOP_PHRASES if " " not in p}
+        # Stop / interruption phrases
+        default_stops = (
+            "stop, wait, hold on, pause, cancel, one second, hang on, listen,"
+            "start over, repeat, bas, ruk, ruko, band karo"
+        )
+        stops_raw = os.getenv("INTERRUPT_WORDS", default_stops)
+        stop_phrases = [p.strip().lower() for p in stops_raw.split(",") if p.strip()]
+
+        min_words = int(os.getenv("MIN_WORDS_FOR_INTERRUPT", "3"))
+        max_tts_age = float(os.getenv("INTERRUPT_DURATION_S", "4.0"))
+
+        return cls(
+            ignored_words=ignored_words,
+            stop_phrases=stop_phrases,
+            min_words_for_interrupt=min_words,
+            max_tts_speaking_before_any_interrupt=max_tts_age,
+        )
 
 
-# --- Utilities ---
-def clean_text(text: str) -> str:
+def _normalize(text: str) -> str:
+    """Lowercase and strip punctuation for simple word-level checks."""
     return re.sub(r"[^\w\s]", "", text.lower()).strip()
 
 
-def tokenize(text: str):
-    return clean_text(text).split()
+def _split_words(text: str) -> list[str]:
+    norm = _normalize(text)
+    return norm.split() if norm else []
 
 
-def is_pure_filler(text: str) -> bool:
-    """True if all tokens are fillers (or text empty)."""
-    if not text or not text.strip():
-        return True
-    words = tokenize(text)
-    return bool(words) and all(word in FILLER_SET for word in words)
+# ============================================================
+# 2. LOGGING SETUP
+# ============================================================
 
+logger = logging.getLogger("agent")
+logger.setLevel(logging.INFO)
 
-def contains_interrupt_word(text: str) -> bool:
-    """True if text contains any configured stop/interrupt signal (whole words)."""
-    if not text or not text.strip():
+# Only add handlers once to avoid duplicate logs on reload
+if not logger.handlers:
+    console = logging.StreamHandler()
+    console.setLevel(logging.INFO)
+
+    # Log to file with daily-ish appends
+    logfile = logging.FileHandler("voice_agent_interrupts.log", mode="a", encoding="utf-8")
+    logfile.setLevel(logging.INFO)
+
+    formatter = logging.Formatter(
+        fmt="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    console.setFormatter(formatter)
+    logfile.setFormatter(formatter)
+
+    logger.addHandler(console)
+    logger.addHandler(logfile)
+
+# ============================================================
+# 3. VOICE BEHAVIOR CONTROLLER
+# ============================================================
+
+class ConversationGuard:
+    """
+    ConversationGuard attaches to a LiveKit AgentSession and listens for:
+      - TTS start/stop events (to know when the assistant is speaking)
+      - Final user transcripts (user_input_transcribed)
+
+    It then classifies overlapping user speech into:
+      - pure filler -> ignored
+      - explicit stop / control phrases -> interrupt
+      - meaningful speech -> interrupt
+
+    When the assistant is *not* speaking, it mostly lets the normal flow happen,
+    only ignoring filler lines.
+    """
+
+    def __init__(self, session: AgentSession, config: InterruptConfig | None = None) -> None:
+        self._session = session
+        self._config = config or InterruptConfig.from_env()
+
+        # Convert config lists to faster lookup structures
+        self._filler_set = set(self._config.ignored_words)
+        self._stop_phrases = list(self._config.stop_phrases)
+
+        # Runtime state
+        self._assistant_tts_active: bool = False
+        self._tts_started_at: float | None = None
+
+        # Register event listeners on the session
+        self._register_event_hooks()
+
+        logger.info(
+            "ConversationGuard initialized | fillers=%d | stop_phrases=%d",
+            len(self._filler_set),
+            len(self._stop_phrases),
+        )
+
+    # --- Event hook registration ---
+
+    def _register_event_hooks(self) -> None:
+        @self._session.on("tts_started")
+        def _on_tts_started(_ev) -> None:
+            self._assistant_tts_active = True
+            self._tts_started_at = time.time()
+            logger.info("ConversationGuard: TTS started (assistant is speaking)")
+
+        @self._session.on("tts_stopped")
+        def _on_tts_stopped(_ev) -> None:
+            self._assistant_tts_active = False
+            self._tts_started_at = None
+            logger.info("ConversationGuard: TTS stopped (assistant is silent)")
+
+        @self._session.on("user_input_transcribed")
+        def _on_user_input(ev: UserInputTranscribedEvent) -> None:
+            # We only care about final ASR output to avoid jittery partials
+            if not getattr(ev, "is_final", True):
+                return
+
+            raw_text = (ev.transcript or "").strip()
+            if not raw_text:
+                return
+
+            self._process_user_text(raw_text)
+
+    # --- Classification helpers ---
+
+    def _is_pure_filler(self, text: str) -> bool:
+        words = _split_words(text)
+        return bool(words) and all(w in self._filler_set for w in words)
+
+    def _contains_stop_phrase(self, text: str) -> bool:
+        norm = text.lower()
+        for phrase in self._stop_phrases:
+            pattern = r"\b" + re.escape(phrase) + r"\b"
+            if re.search(pattern, norm):
+                return True
         return False
-    low = text.lower()
 
-    # Phrase-level (handles "hold on", "one second")
-    for phrase in STOP_PHRASES:
-        pattern = r"\b" + re.escape(phrase) + r"\b"
-        if re.search(pattern, low):
-            return True
+    def _elapsed_tts_time(self) -> float:
+        if self._tts_started_at is None:
+            return 0.0
+        return time.time() - self._tts_started_at
 
-    toks = set(tokenize(low))
-    return any(tok in STOP_TOKENS for tok in toks)
+    # --- Core decision engine ---
+
+    def _process_user_text(self, text: str) -> None:
+        """Route user speech depending on whether TTS is active."""
+        if self._assistant_tts_active:
+            self._handle_overlap_with_tts(text)
+        else:
+            self._handle_while_silent(text)
+
+    def _handle_overlap_with_tts(self, text: str) -> None:
+        """
+        Logic when user speech happens while the assistant is talking.
+        We decide whether:
+          - to ignore (pure filler / very short),
+          - or to actively interrupt the assistant.
+        """
+        words = _split_words(text)
+        word_count = len(words)
+        elapsed = self._elapsed_tts_time()
+
+        # Pure filler -> ignore & optionally clean up the current user turn
+        if self._is_pure_filler(text):
+            logger.info(
+                "ConversationGuard: filler DURING TTS ignored | text=%r | elapsed=%.2fs",
+                text,
+                elapsed,
+            )
+            try:
+                # clear any accumulated user turn so this doesn't feed the LLM
+                self._session.clear_user_turn()
+            except RuntimeError:
+                pass
+            return
+
+        # Explicit stop / correction phrase -> immediate interruption
+        if self._contains_stop_phrase(text):
+            logger.info(
+                "ConversationGuard: STOP phrase DURING TTS -> interrupt | text=%r | elapsed=%.2fs",
+                text,
+                elapsed,
+            )
+            self._session.interrupt(force=True)
+            return
+
+        # Long enough or late enough -> treat as a real interruption
+        if (
+            word_count >= self._config.min_words_for_interrupt
+            or elapsed >= self._config.max_tts_speaking_before_any_interrupt
+        ):
+            logger.info(
+                (
+                    "ConversationGuard: REAL INTERRUPTION DURING TTS -> interrupt | "
+                    "text=%r | words=%d | elapsed=%.2fs"
+                ),
+                text,
+                word_count,
+                elapsed,
+            )
+            self._session.interrupt(force=True)
+            return
+
+        # Short non-filler utterance, early in assistant speech:
+        logger.info(
+            "ConversationGuard: short overlap DURING TTS ignored | text=%r | words=%d | elapsed=%.2fs",
+            text,
+            word_count,
+            elapsed,
+        )
+
+    def _handle_while_silent(self, text: str) -> None:
+        """
+        Logic when the assistant is NOT speaking.
+        Mostly let the normal agent flow handle it, but:
+          - ignore standalone filler lines
+          - optionally react to stop phrases (e.g. queued speech)
+        """
+        if self._is_pure_filler(text):
+            logger.info("ConversationGuard: filler while silent ignored | text=%r", text)
+            return
+
+        if self._contains_stop_phrase(text):
+            logger.info("ConversationGuard: stop phrase while silent | text=%r", text)
+            # In most cases nothing to interrupt, but we try for consistency
+            try:
+                self._session.interrupt(force=True)
+            except RuntimeError:
+                pass
+            return
+
+        # Normal user input, nothing special from our side
+        logger.info("ConversationGuard: normal user input | text=%r", text)
 
 
-# =========================================================================
-# 3️⃣ ASSISTANT CLASS
-# =========================================================================
+# ============================================================
+# 4. ASSISTANT CLASS & PREWARM
+# ============================================================
+
 class Assistant(Agent):
     def __init__(self) -> None:
         super().__init__(
             instructions=(
-                "You are a helpful, friendly, and conversational voice AI assistant. "
-                "The user interacts with you via voice, so keep responses natural, concise, and free from complex symbols."
+                "You are a natural, friendly voice AI assistant. "
+                "Users talk to you by voice, so reply in clear, simple sentences, "
+                "without emojis or fancy formatting. Be concise but warm."
             ),
         )
 
 
-def prewarm(proc: JobProcess):
+def prewarm(proc: JobProcess) -> None:
+    """
+    Load any heavy models *once* per worker process so that
+    subsequent jobs start faster.
+    """
     proc.userdata["vad"] = silero.VAD.load()
+    logger.info("Prewarm: Silero VAD loaded and cached in proc.userdata")
 
 
-# =========================================================================
-# 4️⃣ ENTRYPOINT & EVENT HANDLERS
-# =========================================================================
-async def entrypoint(ctx: JobContext):
+# ============================================================
+# 5. JOB ENTRYPOINT
+# ============================================================
+
+async def entrypoint(ctx: JobContext) -> None:
+    # Add room name into all log records from this job, if desired
     ctx.log_context_fields = {"room": ctx.room.name}
-    logger.info(f"🚀 Starting agent in room: {ctx.room.name}")
+    logger.info("Starting new voice session for room=%s", ctx.room.name)
 
+    # Assemble the voice pipeline: STT + LLM + TTS + turn detection + VAD
     session = AgentSession(
         stt=inference.STT(model="assemblyai/universal-streaming", language="en"),
         llm=inference.LLM(model="openai/gpt-4.1-mini"),
-        tts=inference.TTS(model="cartesia/sonic-3", voice="9626c31c-bec5-4cca-baa8-f8ba9e84c8bc"),
+        tts=inference.TTS(
+            model="cartesia/sonic-3",
+            voice="9626c31c-bec5-4cca-baa8-f8ba9e84c8bc",
+        ),
         turn_detection=MultilingualModel(),
         vad=ctx.proc.userdata["vad"],
         preemptive_generation=True,
+        # you can tweak these AgentSession-level params if needed
         min_interruption_words=1,
         false_interruption_timeout=0.4,
     )
 
+    # Attach our custom conversation guard to the session
+    guard_config = InterruptConfig.from_env()
+    ConversationGuard(session, config=guard_config)
+
+    # Usage metrics
     usage_collector = metrics.UsageCollector()
 
     @session.on("metrics_collected")
-    def _on_metrics_collected(ev: MetricsCollectedEvent):
+    def _on_metrics(ev: MetricsCollectedEvent) -> None:
         metrics.log_metrics(ev.metrics)
         usage_collector.collect(ev.metrics)
 
-    async def log_usage():
+    async def _log_usage_summary() -> None:
         summary = usage_collector.get_summary()
-        logger.info(f"📊 Usage Summary: {summary}")
+        logger.info("Usage summary: %s", summary)
 
-    ctx.add_shutdown_callback(log_usage)
+    ctx.add_shutdown_callback(_log_usage_summary)
 
-    # =====================================================
-    # 🔹 MONITOR ASSISTANT SPEECH (TTS STATE)
-    # =====================================================
-    assistant_speaking = False
-    speak_start_time = None
-
-    @session.on("tts_started")
-    def _on_tts_start(_):
-        nonlocal assistant_speaking, speak_start_time
-        assistant_speaking = True
-        speak_start_time = datetime.datetime.now()
-        logger.info("🗣️ Assistant started speaking — ASR monitoring active.")
-
-    @session.on("tts_stopped")
-    def _on_tts_end(_):
-        nonlocal assistant_speaking
-        assistant_speaking = False
-        logger.info("🔇 Assistant finished speaking — ASR monitoring paused.")
-
-    # =====================================================
-    # 🔹 USER SPEECH PROCESSING
-    # =====================================================
-    @session.on("user_input_transcribed")
-    def _on_user_input_transcribed(ev: UserInputTranscribedEvent):
-        if not ev.is_final:
-            return
-
-        text = (ev.transcript or "").strip()
-        if not text:
-            return
-
-        ts = datetime.datetime.now().strftime("%H:%M:%S")
-        conf = getattr(ev, "confidence", None)
-        clean = clean_text(text)
-        word_count = len(clean.split())
-        duration = (
-            (datetime.datetime.now() - speak_start_time).total_seconds()
-            if speak_start_time
-            else 0
-        )
-
-        # While assistant speaking
-        if assistant_speaking:
-            # Filler words
-            if is_pure_filler(clean):
-                logger.info(f"[{ts}] 💤 ASR filler ignored during TTS: '{text}' (elapsed={duration:.2f}s)")
-                return
-
-            # Stopwords (immediate interrupt)
-            if contains_interrupt_word(clean):
-                logger.info(f"[{ts}] ⛔ ASR stopword interrupt during TTS: '{text}' (elapsed={duration:.2f}s)")
-                session.interrupt()
-                return
-
-            # Real user speech (time/length based)
-            if word_count >= MIN_WORDS_FOR_INTERRUPT or duration > INTERRUPT_DURATION_S:
-                logger.info(
-                    f"[{ts}] ⚡ REAL interrupt (while speaking): '{text}' "
-                    f"(words={word_count}, elapsed={duration:.2f}s, conf={conf})"
-                )
-                session.interrupt()
-                return
-
-            # Short bursts (optional interrupt)
-            logger.info(f"[{ts}] ⚡ SHORT burst ignored during TTS: '{text}' (words={word_count})")
-            return
-
-        # When agent is quiet
-        if is_pure_filler(clean):
-            logger.info(f"[{ts}] 💤 FILLER (agent quiet): '{text}'")
-            return
-
-        if contains_interrupt_word(clean):
-            logger.info(f"[{ts}] ⛔ STOPWORD (agent quiet): '{text}'")
-            session.interrupt()
-            return
-
-        logger.info(f"[{ts}] 📝 REGISTER normal input: '{text}'")
-
-    # =====================================================
-    # 🔹 START SESSION
-    # =====================================================
-
+    # Start agent session and connect to the room
     await session.start(
         agent=Assistant(),
         room=ctx.room,
-        room_input_options=RoomInputOptions(noise_cancellation=noise_cancellation.BVC()),
+        room_input_options=RoomInputOptions(
+            noise_cancellation=noise_cancellation.BVC(),
+        ),
     )
     await ctx.connect()
-    logger.info("✅ Agent session initialized successfully and listening...")
+    logger.info("Agent session fully started and connected for room=%s", ctx.room.name)
 
 
-# =========================================================================
-# 5️⃣ MAIN ENTRYPOINT
-# =========================================================================
+# ============================================================
+# 6. MAIN
+# ============================================================
+
 if __name__ == "__main__":
     cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, prewarm_fnc=prewarm))
